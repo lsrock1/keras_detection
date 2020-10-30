@@ -178,7 +178,7 @@ class Dataprocessor:
             # origin_shape = [256, 128]
             # bs, h, w, 1
             # label = bs, None(the number of boxes per image), 5
-            logits_shape = [38, 22]#[78, 46]#[int(image_size[0]/final_stride), int(image_size[1]/final_stride)]
+            logits_shape = [78, 46]#[38, 22]##[int(image_size[0]/final_stride), int(image_size[1]/final_stride)]
             
 
             x, y = tf.meshgrid(tf.range(logits_shape[1]), tf.range(logits_shape[0]))

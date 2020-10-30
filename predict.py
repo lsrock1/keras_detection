@@ -6,10 +6,13 @@ from detection.model import build_compiled_model
 from detection.datasets.dataset import build_data
 from detection.configs import cfg
 
+import xml.etree.cElementTree as ET
 import argparse
 from pathlib import Path
 import cv2
 import numpy as np
+from tqdm import tqdm
+import os
 
 
 def get_model():
@@ -35,6 +38,34 @@ def get_model():
     return model
 
 
+def create_coco_xml_from_json(save_path, folder, file_name, height, width, objects):
+    root = ET.Element("annotation")
+    ET.SubElement(root, "foler").text = folder
+    ET.SubElement(root, "filename").text = file_name
+
+    # size
+    size = ET.SubElement(root, "size")
+    ET.SubElement(size, "width").text = str(width)
+    ET.SubElement(size, "height").text = str(height)
+    ET.SubElement(size, "depth").text = str(3)
+
+    # object
+
+    for o in objects:
+        # name x, y, x, y
+        added_object = ET.SubElement(root, "object")
+        ET.SubElement(added_object, "name").text = o[0]
+        ET.SubElement(added_object, "difficult").text = str(0)
+        bndbox = ET.SubElement(added_object, "bndbox")
+        ET.SubElement(bndbox, "ymin").text = o[1]
+        ET.SubElement(bndbox, "xmin").text = o[2]
+        ET.SubElement(bndbox, "ymax").text = o[3]
+        ET.SubElement(bndbox, "xmax").text = o[4]
+
+    tree = ET.ElementTree(root)
+    tree.write(save_path)
+
+
 def put_text(img, texts):
         # You may need to adjust text size and position and size.
         # If your images are in [0, 255] range replace (0, 0, 1) with (0, 0, 255)
@@ -46,7 +77,7 @@ def put_text(img, texts):
     return img
 
 
-def get_grid(h=38, w=22):
+def get_grid(h=78, w=46):
     x, y = tf.meshgrid(tf.range(w), tf.range(h))
     x, y = tf.cast(x, tf.float32), tf.cast(y, tf.float32)
     x += 0.5
@@ -60,11 +91,11 @@ def get_grid(h=38, w=22):
 
 
 def predict_and_show(model, ):
-    val_dir = ['/home/ocrusr/datasets/ppe/final/upper_cropped_1/']#cfg.VAL_DIR
+    val_dir = ['/home/ocrusr/datasets/ppe/cropped_video']#cfg.VAL_DIR
     # val_dir = cfg.VAL_DIR
     val_dir = Path(val_dir[0])
     class_names = [d.name for d in val_dir.glob('*')]
-    val_images = val_dir.glob('*/*.jpg')
+    val_images = val_dir.glob('*.jpg')
     val_images = list(val_images)
     # print(val_images)
     np.random.shuffle(val_images)
@@ -96,17 +127,29 @@ def predict_and_show(model, ):
         # print(image_)
         image_ = np.expand_dims(image_, axis=0)
         logits, boxes = model.model(image_, False)
+        # logits_score = tf.math.reduce_max(logits, axis=-1, keepdims=False)
+        # logits_label = tf.math.argmax(logits, axis=-1)
+        # print(tf.reshape(logits[0], -1).shape)
+        # print(tf.reshape(boxes[0], (-1, 4)).shape)
+        # index = tf.image.non_max_suppression(
+        #     tf.reshape(boxes[0], (-1, 4)), tf.reshape(logits_score[0], -1), 1, iou_threshold=0.5,
+        #     score_threshold=float('-inf'), name=None
+        # )
         # logits = tf.nn.softmax(logits)
-        logits, boxes = logits.numpy(), boxes.numpy()
+        # logits, boxes = logits[:, index].numpy(), boxes[:, index].numpy()
         # print(logits)
-        # max_value = np.amax(logits)
-        # print(max_value)
-        # logits = np.amax(logits, axis=-1)
-        # mask = logits == max_value
-        # # logits = logits[..., 1:]
-        logits = logits > 0.5
+        max_value = np.amax(logits)
+        print(max_value)
+        # logits_label = np.argmax(logits, axis=-1)
+        logits = np.amax(logits, axis=-1)
+        mask = logits == max_value
 
-        mask = np.sum(logits, axis=-1, keepdims=False) > 0
+        # # logits = logits[..., 1:]
+        # logits = logits > 0.5
+
+        # mask = np.sum(logits, axis=-1, keepdims=False) > 0
+        # label = logits_label[mask]
+        # print(label)
         # print(np.sum(mask))
         grid_cell = get_grid()
         # print(grid_cell[40, 20])
@@ -153,9 +196,72 @@ def predict_and_show(model, ):
     # print(corr/total)
 
 
+def predict_and_make_coco(model):
+    results_path = 'predict_results'
+    if not os.path.exists(results_path):
+        os.mkdir(results_path)
+
+    threshold = 0.6
+    val_dir = ['/home/ocrusr/datasets/ppe/cropped_video']#cfg.VAL_DIR
+    val_dir = Path(val_dir[0])
+    
+    val_images = val_dir.glob('*.jpg')
+    val_images = list(val_images)
+    
+    class_names = cfg.MODEL.CLASSES#['hwear', 'hunwear']
+
+    idx = 0
+    for image_path in tqdm(val_images):
+
+        image_raw = tf.io.read_file(str(image_path))
+        image = tf.image.decode_jpeg(image_raw, dct_method='INTEGER_ACCURATE')
+
+        image_ = image / 255
+        image_ = image_ - [[cfg.DATA.MEAN]]
+        image_ = image_ / [[cfg.DATA.STD]]
+        image_ = tf.image.resize(image_, [cfg.DATA.SIZE[1], cfg.DATA.SIZE[0]])
+        image_ = np.expand_dims(image_, axis=0)
+        logits, boxes = model.model(image_, False)
+        
+        max_value = np.amax(logits)
+
+        if max_value > threshold:
+            label = np.argmax(logits, axis=-1)
+            logits = np.amax(logits, axis=-1)
+            mask = logits == max_value
+
+            grid_cell = get_grid()
+            boxes = np.stack([
+                    grid_cell[..., 0] - boxes[..., 0],
+                    grid_cell[..., 1] - boxes[..., 1],
+                    boxes[..., 2] + grid_cell[..., 2],
+                    boxes[..., 3] + grid_cell[..., 3]
+                ], axis=-1)
+            boxes = boxes[mask].reshape([-1, 4])
+            label = int(label[mask].reshape([1]))
+            boxes = np.clip(boxes, a_min=0, a_max=1)
+            class_name = class_names[label]
+            image = image.numpy()
+            h, w, c = image.shape
+            detected_box = boxes[0]
+            detected_box = [detected_box[0] * h, detected_box[1] * w, detected_box[2] * h, detected_box[3] * w]
+            detected_box = [str(int(i)) for i in detected_box]
+            objects = [[class_name] + detected_box]
+            create_coco_xml_from_json(
+                os.path.join(results_path, os.path.basename(image_path).replace('jpg', 'xml')),
+                os.path.dirname(image_path), os.path.basename(image_path),
+                h, w, objects)
+        
+        # print(class_name)
+        # for b in boxes:
+        #     image = cv2.rectangle(image, (int(b[1] * w), int(b[0] * h)), (int(b[3] * w), int(b[2] * h)), (255, 0, 0), 1)
+        # cv2.imwrite(f'{idx}.jpg', image.astype(np.uint8))
+        # idx += 1
+
+
 def main():
     model = get_model()
-    predict_and_show(model)
+    predict_and_make_coco(model)
 
 if __name__ == '__main__':
     main()

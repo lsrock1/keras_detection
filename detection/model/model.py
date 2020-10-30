@@ -33,31 +33,6 @@ class ModelInterface:
         else:
             return make_automl_model(cfg)
 
-    def export(self):
-        
-        if not self.is_automl:
-            model = self.model#.export()#.load_weights(path)
-        else:
-            model = self.model.export_model()#.load_weights(path)
-
-        # pop input layer
-        # model.layers.pop(0)
-        # # pop last layer
-        # model.layers.pop()
-        # input = tf.keras.Input(shape=(cfg.DATA.SIZE[1], cfg.DATA.SIZE[0], 3))
-        # normalized_input = normalized_input - [[self.args.DATA.MEAN]]
-        # normalized_input = normalized_input / [[self.args.DATA.STD]]
-
-        # new_output = model(normalized_input)
-        new_output = model.output
-        new_output = new_output / self.args.MODEL.TEMPERATURE_SCALING
-        new_output = tf.keras.layers.Activation('softmax')(new_output)
-
-        model = tf.keras.models.Model(inputs=model.input, outputs=new_output)
-        self.model = model
-        self.compile()
-        return self.model
-
     def save(self, path):
         if not self.is_automl:
             model = self.model.export()#.load_weights(path)
@@ -83,13 +58,64 @@ class ModelInterface:
         normalized_input = normalized_input / [[self.args.DATA.STD]]
         
         new_output = model(normalized_input)
+        pred_box, logits = new_output
+
+        # postprocessing for inference
+        # bs, max value per each image
+        max_value = tf.math.reduce_max(tf.reshape(logits, [tf.shape(logits)[0], -1]), axis=-1)
+
+        # bs, h, w
+        label = tf.math.argmax(logits, axis=-1)
+        # bs, h, w
+        logits = tf.math.reduce_max(logits, axis=-1)
+        # bs, h, w
+        mask = logits == tf.expand_dims(tf.expand_dims(max_value, axis=-1), axis=-1)
+        mask = tf.logical_and(mask, logits > self.args.INFERENCE_THRESHOLD) 
+        grid_cell = self.model.grid_cell(46, 78)
+        boxes = tf.stack([
+                grid_cell[..., 0] - pred_box[..., 0],
+                grid_cell[..., 1] - pred_box[..., 1],
+                pred_box[..., 2] + grid_cell[..., 2],
+                pred_box[..., 3] + grid_cell[..., 3]
+            ], axis=-1)
+        boxes = tf.boolean_mask(boxes, mask)
+        # boxes = tf.reshape(boxes, [-1, 4])
+        # boxes = boxes[mask].reshape([-1, 4])
+        label = tf.boolean_mask(label, mask)
+        # label = tf.reshape(label, [-1])
+        boxes = tf.clip_by_value(boxes, clip_value_min=0, clip_value_max=1)
+        # boxes = np.clip(boxes, a_min=0, a_max=1)
+        # class_name = class_names[label]
+        # image = image.numpy()
+        # h, w, c = image.shape
+        # detected_box = boxes[0]
+        # detected_box = [detected_box[0] * h, detected_box[1] * w, detected_box[2] * h, detected_box[3] * w]
+        # detected_box = [str(int(i)) for i in detected_box]
+        # objects = [[class_name] + detected_box]
+        max_value = tf.boolean_mask(max_value, max_value > self.args.INFERENCE_THRESHOLD)
+        outputs = {
+            'detection_boxes': boxes,
+            'detection_scores': max_value,
+            'detection_classes': label
+        }
+        # results = tf.cond(tf.greater(max_value, tf.constant(self.args.INFERENCE_THRESHOLD)),
+        #     lambda: export_func_true(logits, pred_box, max_value, self.model.grid_cell(46, 78)),
+        #     lambda: {
+        #         'detection_boxes': [],
+        #         'detection_scores': [],
+        #         'detection_classes': []
+        #     }
+        # )
+
         # model.summary()
-        model = tf.keras.models.Model(inputs=input, outputs=new_output)
+        model = tf.keras.models.Model(inputs=input, outputs=outputs)
         self.model = model
         self.compile()
         self.model.summary()
         # self.model.save(path)
         tf.saved_model.save(self.model, path)
+
+    
 
     def compile(self):
         if not self.is_automl:
@@ -216,6 +242,11 @@ class ModelInterface:
             return adapted[0]
         return tf.data.Dataset.zip(tuple(adapted))
 
+
+# def export_func_true(logits, pred_box, max_value, grid_cell):
+    # box, score, class
+    # bs, h, w, c
+    
 
 def build_compiled_model(cfg, for_export=False):
     return ModelInterface(cfg, for_export)

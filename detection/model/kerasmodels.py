@@ -135,13 +135,27 @@ class CustomModel(tf.keras.Model):
 
         return keras.Sequential(layers_)
 
+    # def standalone_call(self, x):
+    #     #  input = tf.keras.Input(shape=(height, width, 3))
+    #     x = preprocessing.Rescaling(1./255)(x)
+    #     normalized_input = x - [[self.args.DATA.MEAN]]
+    #     normalized_input = normalized_input / [[self.args.DATA.STD]]
+    #     output = self.model(normalized_input)
+    #     output = self.deconv_layers(output)
+    #     box_pred = self.box_pred(output)
+    #     box_pred = box_pred * self.scaler
+    #     box_pred = self.final_relu(box_pred)
+    #     logits = self.final_logit(output)
+    #     return logits, box_pred
+
     def export(self):
         output = self.model.output
-        output = self.fc(output)
-        if self.cfg.MODEL.TEMPERATURE_SCALING != 1:
-            output = preprocessing.Rescaling(1./self.cfg.MODEL.TEMPERATURE_SCALING)(output)
-        output = self.softmax(output)
-        return Model(inputs=self.model.input, outputs=output)
+        output = self.deconv_layers(output)
+        box_pred = self.box_pred(output)
+        box_pred = box_pred * self.scaler
+        box_pred = self.final_relu(box_pred)
+        logits = self.final_logit(output)
+        return Model(inputs=self.model.input, outputs=[box_pred, logits])
 
     def add_weight_decay(self, weight_decay):
         for layer in self.model.layers:
@@ -202,40 +216,26 @@ class CustomModel(tf.keras.Model):
                 "box_loss": box_loss
             }
 
-    def loss_matching(self, logits, box_pred, label):
-        origin_shape = [256, 128]
-        # bs, h, w, 1
-        # label = bs, None(the number of boxes per image), 5
-        logits_shape = tf.cast(tf.shape(logits), tf.float32)
-        # logits_label = tf.zeros([logits_shape[0], logits_shape[1], logits_shape[2], 3], dtype=tf.float32)
-
-        x, y = tf.meshgrid(tf.range(logits_shape[2]), tf.range(logits_shape[1]))
+    def grid_cell(self, width, height):
+        x, y = tf.meshgrid(tf.range(width), tf.range(height))
+        x, y = tf.cast(x, tf.float32), tf.cast(y, tf.float32)
         x += 0.5
         y += 0.5
         # h, w
-        x /= logits_shape[2]
-        y /= logits_shape[1]
+        x /= width
+        y /= height
         # h, w, 4 (yxyx)
         grid_cell = tf.stack([y, x, y, x], axis=-1)
         grid_cell = tf.expand_dims(grid_cell, axis=0)
+        return grid_cell
+
+    def loss_matching(self, logits, box_pred, label):
+        logits_shape = tf.cast(tf.shape(logits), tf.float32)
+        # grid_cell = self.grid_cell(logits_shape[2], logits_shape[1])
 
         box_label, logits_label = label[..., :4], label[..., 4:]
-        # logits_loss = sparse_categorical_focal_loss(logits_label, logits, 2.0, from_logits=True)
-        # logits_loss = tf.nn.softmax_cross_entropy_with_logits(tf.cast(logits_label, tf.int64), logits)
         logits_loss = tfa.losses.sigmoid_focal_crossentropy(logits_label, logits, from_logits=False)
-        # tf.print(tf.reduce_sum(logits_label))
-        # tf.print(tf.size(logits_label))
-        # tf.print(grid_cell[..., 0].shape)
         logits_loss = tf.reduce_sum(logits_loss)
-        # encoded_box = tf.stack([
-        #         grid_cell[..., 0] - box_pred[..., 0],
-        #         grid_cell[..., 1] - box_pred[..., 1],
-        #         box_pred[..., 2] + grid_cell[..., 2],
-        #         box_pred[..., 3] + grid_cell[..., 3]
-        #     ], axis=-1)
-        
-        # encoded_box = tf.clip_by_value(encoded_box, clip_value_min=0, clip_value_max=1)
-        # tf.print('here' * 10)
         mask = tf.math.reduce_sum(logits_label, axis=-1)
         mask = tf.math.greater(mask, tf.constant(0.))
         # encoded_box = tf.boolean_mask(encoded_box, mask)
@@ -246,7 +246,6 @@ class CustomModel(tf.keras.Model):
         # tf.print(box_label)
         box_loss = self.iou_loss(box_label, box_pred)
 
-        # box_loss = tfa.losses.giou_loss(box_target, encoded_box)
         logits_loss = logits_loss / tf.reduce_sum(tf.cast(mask, tf.float32))
         box_loss = box_loss / tf.reduce_sum(tf.cast(mask, tf.float32))
         return logits_loss, box_loss
