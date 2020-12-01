@@ -12,7 +12,7 @@ from .transforms import _resize
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE\
 
-
+# head keyword == only head
 class Dataprocessor:
     def __init__(self, args):
         self.args = args
@@ -130,6 +130,7 @@ class Dataprocessor:
         xmins_filtered, ymins_filtered, xmaxs_filtered, ymaxs_filtered = [], [], [], []
         for n, xmin, ymin, xmax, ymax in zip(names, xmins, ymins, xmaxs, ymaxs):
             if n in self.classes:
+                # only head
                 labels.append(self.classes.index(n) + 1)
                 xmins_filtered.append(xmin)
                 ymins_filtered.append(ymin)
@@ -173,12 +174,13 @@ class Dataprocessor:
         final_stride = self.args.FINAL_STRIDE
         image_size = [self.args.DATA.SIZE[1], self.args.DATA.SIZE[0]]
         classes = self.args.MODEL.NUM_CLASSES
+        feature_shape = self.args.FEATURE_SHAPE
 
         def loss_matching(label):
             # origin_shape = [256, 128]
             # bs, h, w, 1
             # label = bs, None(the number of boxes per image), 5
-            logits_shape = [78, 46]#[38, 22]##[int(image_size[0]/final_stride), int(image_size[1]/final_stride)]
+            logits_shape = feature_shape#[78, 46]#[38, 22]##[int(image_size[0]/final_stride), int(image_size[1]/final_stride)]
             
 
             x, y = tf.meshgrid(tf.range(logits_shape[1]), tf.range(logits_shape[0]))
@@ -229,17 +231,14 @@ class Dataprocessor:
             centers_distance = tf.where(is_not_in_boxes, 99999., centers_distance)
             # h * w
             gt_index = tf.math.argmin(centers_distance, axis=1)
-            # tf.print(tf.math.reduce_max(gt_index))
-            # tf.print(centers_distance.shape)
-            # tf.print(label.shape)
-            # tf.print(label[:, 4][gt_index[10]])
+            
+            # only head
             logits_label = tf.gather(label[:, 4], gt_index) - 1
-            # tf.print(tf.unique(label[:, 4]))
             min_centers_distance = tf.math.reduce_min(centers_distance, axis=1, keepdims=False)
             logits_label = tf.where(min_centers_distance == 99999, -1., logits_label)
             logits_label = tf.cast(logits_label, tf.int64)
-            # tf.print(tf.unique(logits_label))
             logits_label = tf.one_hot(logits_label, classes-1, on_value=1.0, off_value=0.0, axis=-1)
+
             # label_class = tf.cast(label[:, 4], tf.int64) - 1
             # logits_label = tf.ones([logits_shape[0], logits_shape[1]], dtype=tf.int64) * -1
             # logits_label = tf.tensor_scatter_nd_update(logits_label, centers_label, label_class)
@@ -280,9 +279,17 @@ class Dataprocessor:
                 box_label[..., 2] - grid_cell_hw[..., 0],
                 box_label[..., 3] - grid_cell_hw[..., 1]
             ], axis=-1)
-            # tf.print(box_label)
+
+            left_right = tf.stack([box_label[..., 0], box_label[..., 2]], axis=-1)
+            top_bottom = tf.stack([box_label[..., 1], box_label[..., 3]], axis=-1)
+            centerness = (tf.math.reduce_min(left_right, axis=-1, keepdims=True) / tf.math.reduce_max(left_right, axis=-1, keepdims=True)) * \
+                        (tf.math.reduce_min(top_bottom, axis=-1, keepdims=True) / tf.math.reduce_max(top_bottom, axis=-1, keepdims=True))
+            # centerness = (left_right.min(dim=-1)[0] / left_right.max(dim=-1)[0]) * \
+            #             (top_bottom.min(dim=-1)[0] / top_bottom.max(dim=-1)[0])
+            # return torch.sqrt(centerness)
+            
             logits_label = tf.reshape(logits_label, [logits_shape[0], logits_shape[1], -1])
-            return tf.concat([box_label, logits_label], axis=-1)
+            return tf.concat([box_label, logits_label, centerness], axis=-1)
 
         def _parse_image_function(example_proto):
             # Parse the input tf.Example proto using the dictionary above.

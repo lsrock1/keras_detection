@@ -17,8 +17,6 @@ from tensorflow.keras.applications.inception_resnet_v2 import InceptionResNetV2
 from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2
 from tensorflow.keras.applications.densenet import DenseNet121, DenseNet169, DenseNet201
 
-from focal_loss import sparse_categorical_focal_loss
-
 
 keras_factory = {
     'mobilenet': MobileNetV2,
@@ -66,11 +64,18 @@ class CustomModel(tf.keras.Model):
         self.deconv_with_bias = cfg.DECONV_WITH_BIAS
         self.model = keras_factory[model_name](
             weights='imagenet', include_top=False, input_tensor=Input(shape= size + [3]))
-        self.deconv_layers = self._make_deconv_layer(
-            cfg.NUM_DECONV_LAYERS,
-            cfg.NUM_DECONV_FILTERS,
-            cfg.NUM_DECONV_KERNELS,
-        )
+        # self.deconv_layers = self._make_deconv_layer(
+        #     cfg.NUM_DECONV_LAYERS,
+        #     cfg.NUM_DECONV_FILTERS,
+        #     cfg.NUM_DECONV_KERNELS,
+        # )
+        self.middle_layers =  keras.Sequential([
+            layers.Conv2D(
+                filters=filters,
+                kernel_size=3,
+                padding='same', activation='relu'
+            ) for filters in cfg.NUM_DECONV_FILTERS
+        ])
         self.box_pred = keras.Sequential([
             layers.Conv2D(
                 filters=4,
@@ -89,7 +94,15 @@ class CustomModel(tf.keras.Model):
                 padding='same', activation='sigmoid'
             )
         ])
-        
+
+        self.centerness = keras.Sequential([
+            layers.Conv2D(
+                filters=1,
+                kernel_size=cfg.FINAL_CONV_KERNEL,
+                padding='same'
+            )
+        ])
+
         self.add_weight_decay(weight_decay)
 
     def _get_deconv_cfg(self, deconv_kernel, index):
@@ -135,22 +148,9 @@ class CustomModel(tf.keras.Model):
 
         return keras.Sequential(layers_)
 
-    # def standalone_call(self, x):
-    #     #  input = tf.keras.Input(shape=(height, width, 3))
-    #     x = preprocessing.Rescaling(1./255)(x)
-    #     normalized_input = x - [[self.args.DATA.MEAN]]
-    #     normalized_input = normalized_input / [[self.args.DATA.STD]]
-    #     output = self.model(normalized_input)
-    #     output = self.deconv_layers(output)
-    #     box_pred = self.box_pred(output)
-    #     box_pred = box_pred * self.scaler
-    #     box_pred = self.final_relu(box_pred)
-    #     logits = self.final_logit(output)
-    #     return logits, box_pred
-
     def export(self):
         output = self.model.output
-        output = self.deconv_layers(output)
+        output = self.middle_layers(output)
         box_pred = self.box_pred(output)
         box_pred = box_pred * self.scaler
         box_pred = self.final_relu(box_pred)
@@ -163,7 +163,7 @@ class CustomModel(tf.keras.Model):
             if hasattr(layer, 'kernel_regularizer'):
                 layer.kernel_regularizer= l2(weight_decay)
         
-        for layer in self.deconv_layers.layers:
+        for layer in self.middle_layers.layers:
             layer.trainable = True
             if hasattr(layer, 'kernel_regularizer'):
                 layer.kernel_regularizer= l2(weight_decay)
@@ -173,25 +173,31 @@ class CustomModel(tf.keras.Model):
             if hasattr(layer, 'kernel_regularizer'):
                 layer.kernel_regularizer= l2(weight_decay)
 
+        for layer in self.centerness.layers:
+            layer.trainable = True
+            if hasattr(layer, 'kernel_regularizer'):
+                layer.kernel_regularizer= l2(weight_decay)
+
     def __call__(self, x, training=False):
         self.model.trainable = training
-        self.deconv_layers.trainable = training
+        self.middle_layers.trainable = training
         self.box_pred.trainable = training
         self.final_logit.trainable = training
         output = self.model(x)
-        output = self.deconv_layers(output)
+        output = self.middle_layers(output)
         box_pred = self.box_pred(output)
         box_pred = box_pred * self.scaler
         box_pred = self.final_relu(box_pred)
         logits = self.final_logit(output)
-        return logits, box_pred
+        centerness = self.centerness(output)
+        return logits, box_pred, centerness
 
     def test_step(self, data):
         data, label, weights = unpack_x_y_sample_weight(data)
 
-        logits, box_pred = self(data, False)
-        logits_loss, box_loss = self.loss_matching(logits, box_pred, label)
-        total_loss = logits_loss + box_loss
+        logits, box_pred, centerness = self(data, False)
+        logits_loss, box_loss, centerness_loss = self.loss_matching(logits, box_pred, centerness, label)
+        total_loss = logits_loss + box_loss + centerness_loss
         # loss = tf.math.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(label, pred))
         # self.compiled_metrics.update_state(label, pred, weights)
         results = {m.name: m.result() for m in self.metrics}
@@ -203,17 +209,18 @@ class CustomModel(tf.keras.Model):
         data, label, weights = unpack_x_y_sample_weight(data)
             
         with tf.GradientTape() as tape:
-            logits, box_pred = self(data, True)
+            logits, box_pred, centerness = self(data, True)
 
-            logits_loss, box_loss = self.loss_matching(logits, box_pred, label)
-            total_loss = logits_loss + box_loss
+            logits_loss, box_loss, centerness_loss = self.loss_matching(logits, box_pred, centerness, label)
+            total_loss = logits_loss + box_loss + centerness_loss
             # print(self.trainable_weights)
             grads = tape.gradient(total_loss, self.trainable_weights)
             self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
             return {
                 "loss": total_loss,
                 "logits_loss": logits_loss,
-                "box_loss": box_loss
+                "box_loss": box_loss,
+                "centerness_loss": centerness_loss
             }
 
     def grid_cell(self, width, height):
@@ -229,11 +236,11 @@ class CustomModel(tf.keras.Model):
         grid_cell = tf.expand_dims(grid_cell, axis=0)
         return grid_cell
 
-    def loss_matching(self, logits, box_pred, label):
+    def loss_matching(self, logits, box_pred, centerness, label):
         logits_shape = tf.cast(tf.shape(logits), tf.float32)
         # grid_cell = self.grid_cell(logits_shape[2], logits_shape[1])
 
-        box_label, logits_label = label[..., :4], label[..., 4:]
+        box_label, logits_label, centerness_label = label[..., :4], label[..., 4:5], label[..., 5:]
         logits_loss = tfa.losses.sigmoid_focal_crossentropy(logits_label, logits, from_logits=False)
         logits_loss = tf.reduce_sum(logits_loss)
         mask = tf.math.reduce_sum(logits_label, axis=-1)
@@ -245,10 +252,16 @@ class CustomModel(tf.keras.Model):
         # tf.print(box_pred)
         # tf.print(box_label)
         box_loss = self.iou_loss(box_label, box_pred)
+        mask = tf.expand_dims(mask, axis=-1)
+        centerness_label = tf.where(mask, centerness_label, 0.)#tf.boolean_mask(centerness_label, mask)
+        # tf.print(centerness_label)
+        centerness_loss = tf.nn.sigmoid_cross_entropy_with_logits(centerness_label, centerness)
+        centerness_loss = tf.reduce_sum(centerness_loss)
 
         logits_loss = logits_loss / tf.reduce_sum(tf.cast(mask, tf.float32))
         box_loss = box_loss / tf.reduce_sum(tf.cast(mask, tf.float32))
-        return logits_loss, box_loss
+        centerness_loss = centerness_loss / tf.reduce_sum(tf.cast(mask, tf.float32))
+        return logits_loss, box_loss, centerness_loss
 
     def iou_loss(self, target, pred):
         pred_left = pred[:, 1]

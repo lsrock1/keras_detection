@@ -58,7 +58,8 @@ class ModelInterface:
         normalized_input = normalized_input / [[self.args.DATA.STD]]
         
         new_output = model(normalized_input)
-        pred_box, logits = new_output
+        pred_box, logits, centerness = new_output
+        logits = logits * tf.math.sigmoid(centerness)
 
         # postprocessing for inference
         # bs, max value per each image
@@ -70,8 +71,8 @@ class ModelInterface:
         logits = tf.math.reduce_max(logits, axis=-1)
         # bs, h, w
         mask = logits == tf.expand_dims(tf.expand_dims(max_value, axis=-1), axis=-1)
-        mask = tf.logical_and(mask, logits > self.args.INFERENCE_THRESHOLD) 
-        grid_cell = self.model.grid_cell(46, 78)
+        # mask = tf.logical_and(mask, logits > self.args.INFERENCE_THRESHOLD) 
+        grid_cell = self.model.grid_cell(self.args.FEATURE_SHAPE[1], self.args.FEATURE_SHAPE[0])
         boxes = tf.stack([
                 grid_cell[..., 0] - pred_box[..., 0],
                 grid_cell[..., 1] - pred_box[..., 1],
@@ -84,38 +85,19 @@ class ModelInterface:
         label = tf.boolean_mask(label, mask)
         # label = tf.reshape(label, [-1])
         boxes = tf.clip_by_value(boxes, clip_value_min=0, clip_value_max=1)
-        # boxes = np.clip(boxes, a_min=0, a_max=1)
-        # class_name = class_names[label]
-        # image = image.numpy()
-        # h, w, c = image.shape
-        # detected_box = boxes[0]
-        # detected_box = [detected_box[0] * h, detected_box[1] * w, detected_box[2] * h, detected_box[3] * w]
-        # detected_box = [str(int(i)) for i in detected_box]
-        # objects = [[class_name] + detected_box]
-        max_value = tf.boolean_mask(max_value, max_value > self.args.INFERENCE_THRESHOLD)
+        
         outputs = {
             'detection_boxes': boxes,
             'detection_scores': max_value,
             'detection_classes': label
         }
-        # results = tf.cond(tf.greater(max_value, tf.constant(self.args.INFERENCE_THRESHOLD)),
-        #     lambda: export_func_true(logits, pred_box, max_value, self.model.grid_cell(46, 78)),
-        #     lambda: {
-        #         'detection_boxes': [],
-        #         'detection_scores': [],
-        #         'detection_classes': []
-        #     }
-        # )
 
-        # model.summary()
         model = tf.keras.models.Model(inputs=input, outputs=outputs)
         self.model = model
         self.compile()
         self.model.summary()
         # self.model.save(path)
         tf.saved_model.save(self.model, path)
-
-    
 
     def compile(self):
         if not self.is_automl:

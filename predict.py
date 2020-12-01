@@ -77,7 +77,7 @@ def put_text(img, texts):
     return img
 
 
-def get_grid(h=78, w=46):
+def get_grid(h=8, w=4):
     x, y = tf.meshgrid(tf.range(w), tf.range(h))
     x, y = tf.cast(x, tf.float32), tf.cast(y, tf.float32)
     x += 0.5
@@ -91,7 +91,7 @@ def get_grid(h=78, w=46):
 
 
 def predict_and_show(model, ):
-    val_dir = ['/home/ocrusr/datasets/ppe/cropped_video']#cfg.VAL_DIR
+    val_dir = ['/home/ocrusr/datasets/falldown/0702_falldown/0702/person']#cfg.VAL_DIR
     # val_dir = cfg.VAL_DIR
     val_dir = Path(val_dir[0])
     class_names = [d.name for d in val_dir.glob('*')]
@@ -164,10 +164,10 @@ def predict_and_show(model, ):
         # print(boxes[0, 40, 20])
         boxes = boxes[mask].reshape([-1, 4])
         boxes = np.clip(boxes, a_min=0, a_max=1)
-        print(boxes)
+        # print(boxes)
         image = image.numpy()
         h, w, c = image.shape
-        print(h, ' ', w)
+        # print(h, ' ', w)
         for b in boxes:
             image = cv2.rectangle(image, (int(b[1] * w), int(b[0] * h)), (int(b[3] * w), int(b[2] * h)), (255, 0, 0), 1)
         cv2.imwrite(f'{idx}.jpg', image.astype(np.uint8))
@@ -230,7 +230,7 @@ def predict_and_make_coco(model):
             logits = np.amax(logits, axis=-1)
             mask = logits == max_value
 
-            grid_cell = get_grid()
+            grid_cell = get_grid(cfg.FEATURE_SHAPE[0], cfg.FEATURE_SHAPE[1])
             boxes = np.stack([
                     grid_cell[..., 0] - boxes[..., 0],
                     grid_cell[..., 1] - boxes[..., 1],
@@ -261,7 +261,7 @@ def predict_and_make_coco(model):
 
 def main():
     model = get_model()
-    predict_and_make_coco(model)
+    predict_and_show(model)
 
 if __name__ == '__main__':
     main()
